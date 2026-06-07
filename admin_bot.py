@@ -117,7 +117,7 @@ async def process_and_save_knowledge(text_content: str, message: types.Message, 
                             ORDER BY embedding <=> $1::vector 
                             LIMIT 1;
                             """,
-                            embedding
+                            str(embedding)
                         )
                     
                     if existing_node_id:
