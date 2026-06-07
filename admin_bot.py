@@ -36,7 +36,7 @@ def get_main_keyboard():
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.set_state(AdminStates.main_menu)
     await message.answer(
-        "Привет, Шеф! Универсальная система управления знаниями готова. Выбери режим работы:",
+        "Привет, Шеф! Система управления знаниями готова. Выбери режим работы:",
         reply_markup=get_main_keyboard()
     )
 
@@ -44,16 +44,16 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def enter_upload_mode(message: types.Message, state: FSMContext):
     await state.set_state(AdminStates.upload_mode)
     await message.answer(
-        "Включен режим загрузки универсальных знаний. 📚\n\n"
-        "Форматы: обычный текст или файлы **.txt** / **.pdf**.\n"
+        "Включен режим загрузки знаний. 📚\n\n"
+        "Сюда можно отправлять текст или файлы **.txt** / **.pdf**.\n"
         "Выход: /start"
     )
 
 @dp.message(F.text == "📊 Режим администрирования")
 async def enter_admin_mode(message: types.Message, state: FSMContext, db_pool: asyncpg.Pool):
-    # db_pool автоматически прокидывается из dp.workflow_data через middleware или напрямую
     await state.set_state(AdminStates.admin_mode)
     try:
+        # Безопасно берем соединение из пула
         async with db_pool.acquire() as conn:
             nodes_count = await conn.fetchval("SELECT COUNT(*) FROM graph_nodes;")
             edges_count = await conn.fetchval("SELECT COUNT(*) FROM graph_edges;")
@@ -73,9 +73,9 @@ async def process_and_save_knowledge(text_content: str, message: types.Message, 
         "Ты — универсальный ИИ-архитектор графов знаний. Твоя задача — проанализировать входящий текст "
         "и разбить его на атомарные смысловые узлы и логические связи между ними.\n\n"
         "Типы узлов (node_type):\n"
-        "- 'rule': жесткое правило, константа, инструкция, шаг алгоритма\n"
-        "- 'objection': проблема, вводная ситуация, возражение, дефект, входящее условие\n"
-        "- 'technique': метод решения, способ отработки, действие, техника выполнения\n\n"
+        "- 'rule': жесткое правило, инструкция, шаг алгоритма\n"
+        "- 'objection': проблема, вводная ситуация, возражение, входящее условие\n"
+        "- 'technique': метод решения, действие, техника выполнения\n\n"
         "Ты должен вернуть ответ СТРОГО в формате JSON. Никакого другого текста вокруг.\n"
         "Формат JSON:\n"
         "{\n"
@@ -96,14 +96,14 @@ async def process_and_save_knowledge(text_content: str, message: types.Message, 
         
         data = json.loads(response.choices[0].message.content)
         
-        # Берём соединение из пула и открываем атомарную транзакцию
+        # Запись в БД через единую безопасную транзакцию
         async with db_pool.acquire() as conn:
             async with conn.transaction():
                 inserted_node_ids = []
                 
-                # 1. Вставка узлов с защитой от дубликатов (требуется UNIQUE UNIQUE(content) в базе)
+                # Запись Узлов
                 for node in data.get("nodes", []):
-                    # Если узел с таким content уже есть, берем его id, иначе вставляем новый
+                    # Если узел уже существует, ON CONFLICT не выдаст ошибку, а вернет ID старого узла
                     node_id = await conn.fetchval(
                         """
                         INSERT INTO graph_nodes (content, node_type) 
@@ -116,13 +116,13 @@ async def process_and_save_knowledge(text_content: str, message: types.Message, 
                     inserted_node_ids.append(node_id)
                     
                 edges_count = 0
-                # 2. Вставка связей
+                # Запись Связей
                 for edge in data.get("edges", []):
                     src_idx = edge["source_index"]
                     tgt_idx = edge["target_index"]
                     
                     if src_idx < len(inserted_node_ids) and tgt_idx < len(inserted_node_ids):
-                        # Защита от дублирования связей
+                        # Если такая связь уже есть, база данных просто пропустит этот шаг (DO NOTHING)
                         await conn.execute(
                             """
                             INSERT INTO graph_edges (source_id, target_id, relation_type) 
@@ -136,7 +136,7 @@ async def process_and_save_knowledge(text_content: str, message: types.Message, 
         await message.answer(
             f"🚀 **Данные успешно интегрированы в граф!**\n\n"
             f"• Обработано смысловых блоков: {len(inserted_node_ids)}\n"
-            f"• Сформировано связей: {edges_count}"
+            f"• Добавлено/проверено связей: {edges_count}"
         )
         
     except Exception as e:
@@ -178,19 +178,17 @@ async def handle_file_upload(message: types.Message, db_pool: asyncpg.Pool):
             return
             
         await message.answer(f"📖 Извлечено {len(extracted_text)} символов. Передаю в DeepSeek...")
-        
-        # TODO: Если текст > 8000 символов, желательно разбивать на чанки!
         await process_and_save_knowledge(extracted_text, message, db_pool)
         
     except Exception as e:
         await message.answer(f"❌ Не удалось прочитать файл: {e}")
 
 async def main():
-    # Инициализируем пул подключений к БД один раз при старте
+    # Создаем пул один раз при старте приложения
     db_url = os.getenv("DATABASE_URL")
     pool = await asyncpg.create_pool(dsn=db_url, min_size=1, max_size=10)
     
-    # Передаем пул в workflow_data, чтобы aiogram автоматически прокидывал его в хендлеры как `db_pool`
+    # Регистрируем пул в dispatcher, чтобы он автоматически передавался аргументом в хендлеры
     dp["db_pool"] = pool
     
     try:
