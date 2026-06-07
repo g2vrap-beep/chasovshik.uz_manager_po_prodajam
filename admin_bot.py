@@ -113,7 +113,7 @@ async def process_and_save_knowledge(text_content: str, message: types.Message, 
                         existing_node_id = await conn.fetchval(
                             """
                             SELECT id FROM graph_nodes 
-                            WHERE 1 - (embedding <=> $1::vector) > 0.85 
+                            WHERE 1 - (embedding <=> $1::vector) > 0.70 
                             ORDER BY embedding <=> $1::vector 
                             LIMIT 1;
                             """,
