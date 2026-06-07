@@ -131,7 +131,7 @@ async def process_and_save_knowledge(text_content: str, message: types.Message, 
                             VALUES ($1, $2, $3) 
                             RETURNING id;
                             """,
-                            content, node_type, embedding
+                            content, node_type, str(embedding)
                         )
                         inserted_node_ids.append(node_id)
                         
