@@ -28,46 +28,44 @@ class AdminStates(StatesGroup):
 def get_main_keyboard():
     builder = ReplyKeyboardBuilder()
     builder.button(text="📥 Режим загрузки")
-    builder.button(text="📊 Режим администрирования")
+    builder.button(text="📊 Режим admin-панели")
     builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
+
+# Функция создания вектора (эмбеддинга) смысла текста
+async def get_embedding(text: str) -> list:
+    try:
+        response = await openai_client.embeddings.create(
+            model="openai/text-embedding-3-small",  # Отличная, быстрая и дешевая модель
+            input=text
+        )
+        return response.data[0].embedding
+    except Exception as e:
+        print(f"Ошибка генерации эмбеддинга: {e}")
+        return []
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.set_state(AdminStates.main_menu)
-    await message.answer(
-        "Привет, Шеф! Система управления знаниями готова. Выбери режим работы:",
-        reply_markup=get_main_keyboard()
-    )
+    await message.answer("Система управления знаниями запущена. Выбери режим:", reply_markup=get_main_keyboard())
 
 @dp.message(F.text == "📥 Режим загрузки")
 async def enter_upload_mode(message: types.Message, state: FSMContext):
     await state.set_state(AdminStates.upload_mode)
-    await message.answer(
-        "Включен режим загрузки знаний. 📚\n\n"
-        "Сюда можно отправлять текст или файлы **.txt** / **.pdf**.\n"
-        "Выход: /start"
-    )
+    await message.answer("Режим загрузки активирован. Отправь текст или .pdf/.txt файл. Выход: /start")
 
-@dp.message(F.text == "📊 Режим администрирования")
+@dp.message(F.text == "📊 Режим admin-панели")
 async def enter_admin_mode(message: types.Message, state: FSMContext, db_pool: asyncpg.Pool):
     await state.set_state(AdminStates.admin_mode)
     try:
-        # Безопасно берем соединение из пула
         async with db_pool.acquire() as conn:
             nodes_count = await conn.fetchval("SELECT COUNT(*) FROM graph_nodes;")
             edges_count = await conn.fetchval("SELECT COUNT(*) FROM graph_edges;")
-        
-        await message.answer(
-            f"📊 **Сводка из базы знаний:**\n\n"
-            f"• Всего концептов/узлов в базе: {nodes_count}\n"
-            f"• Логических связей между ними: {edges_count}\n\n"
-            f"Выход: /start"
-        )
+        await message.answer(f"📊 **База знаний:**\n• Узлов: {nodes_count}\n• Связей: {edges_count}\n\nВыход: /start")
     except Exception as e:
-        await message.answer(f"Ошибка подключения к базе: {e}")
+        await message.answer(f"Ошибка БД: {e}")
 
-# Универсальный конвейер разбора и записи графа
+# Конвейер разбора и векторной записи графа
 async def process_and_save_knowledge(text_content: str, message: types.Message, db_pool: asyncpg.Pool):
     system_prompt = (
         "Ты — универсальный ИИ-архитектор графов знаний. Твоя задача — проанализировать входящий текст "
@@ -76,7 +74,7 @@ async def process_and_save_knowledge(text_content: str, message: types.Message, 
         "- 'rule': жесткое правило, инструкция, шаг алгоритма\n"
         "- 'objection': проблема, вводная ситуация, возражение, входящее условие\n"
         "- 'technique': метод решения, действие, техника выполнения\n\n"
-        "Ты должен вернуть ответ СТРОГО в формате JSON. Никакого другого текста вокруг.\n"
+        "Ты должен вернуть ответ СТРОГО в формате JSON.\n"
         "Формат JSON:\n"
         "{\n"
         '  "nodes": [{"content": "краткое описание сути узла", "type": "rule"||"objection"||"technique"}],\n'
@@ -89,76 +87,96 @@ async def process_and_save_knowledge(text_content: str, message: types.Message, 
             model="deepseek/deepseek-v4-pro",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Разбери этот текст на универсальный граф:\n\n{text_content}"}
+                {"role": "user", "content": f"Разбери текст на граф:\n\n{text_content}"}
             ],
             response_format={"type": "json_object"}
         )
         
         data = json.loads(response.choices[0].message.content)
         
-        # Запись в БД через единую безопасную транзакцию
         async with db_pool.acquire() as conn:
             async with conn.transaction():
                 inserted_node_ids = []
                 
-                # Запись Узлов
+                # Обработка Узлов
                 for node in data.get("nodes", []):
-                    # Если узел уже существует, ON CONFLICT не выдаст ошибку, а вернет ID старого узла
-                    node_id = await conn.fetchval(
-                        """
-                        INSERT INTO graph_nodes (content, node_type) 
-                        VALUES ($1, $2) 
-                        ON CONFLICT (content) DO UPDATE SET node_type = EXCLUDED.node_type
-                        RETURNING id;
-                        """,
-                        node["content"], node["type"]
-                    )
-                    inserted_node_ids.append(node_id)
+                    content = node["content"]
+                    node_type = node["type"]
                     
+                    # Получаем вектор смысла для текущего узла
+                    embedding = await get_embedding(content)
+                    
+                    existing_node_id = None
+                    if embedding:
+                        # Ищем в базе узел, схожесть с которым выше 85% (0.85)
+                        # В pgvector `<=>` — это косинусное расстояние. Схожесть = 1 - расстояние.
+                        existing_node_id = await conn.fetchval(
+                            """
+                            SELECT id FROM graph_nodes 
+                            WHERE 1 - (embedding <=> $1::vector) > 0.85 
+                            ORDER BY embedding <=> $1::vector 
+                            LIMIT 1;
+                            """,
+                            embedding
+                        )
+                    
+                    if existing_node_id:
+                        # Если похожий по смыслу узел найден — используем его ID (не создаем дубль!)
+                        inserted_node_ids.append(existing_node_id)
+                    else:
+                        # Если это принципиально новая мысль — записываем её и её вектор
+                        node_id = await conn.fetchval(
+                            """
+                            INSERT INTO graph_nodes (content, node_type, embedding) 
+                            VALUES ($1, $2, $3) 
+                            RETURNING id;
+                            """,
+                            content, node_type, embedding
+                        )
+                        inserted_node_ids.append(node_id)
+                        
                 edges_count = 0
-                # Запись Связей
+                # Обработка Связей
                 for edge in data.get("edges", []):
                     src_idx = edge["source_index"]
                     tgt_idx = edge["target_index"]
                     
                     if src_idx < len(inserted_node_ids) and tgt_idx < len(inserted_node_ids):
-                        # Если такая связь уже есть, база данных просто пропустит этот шаг (DO NOTHING)
                         await conn.execute(
                             """
                             INSERT INTO graph_edges (source_id, target_id, relation_type) 
                             VALUES ($1, $2, $3)
-                            ON CONFLICT (source_id, target_id, relation_type) DO NOTHING;
+                            ON CONFLICT DO NOTHING;
                             """,
                             inserted_node_ids[src_idx], inserted_node_ids[tgt_idx], edge["relation_type"]
                         )
                         edges_count += 1
                         
         await message.answer(
-            f"🚀 **Данные успешно интегрированы в граф!**\n\n"
-            f"• Обработано смысловых блоков: {len(inserted_node_ids)}\n"
-            f"• Добавлено/проверено связей: {edges_count}"
+            f"🚀 **Векторная интеграция завершена!**\n\n"
+            f"• Обработано блоков: {len(inserted_node_ids)}\n"
+            f"• Проверено/создано связей: {edges_count}"
         )
         
     except Exception as e:
-        await message.answer(f"⚠️ Ошибка обработки: {e}")
+        await message.answer(f"⚠️ Ошибка: {e}")
 
-# Обработчик текста
+# Хендлеры
 @dp.message(AdminStates.upload_mode, F.text)
 async def handle_text_upload(message: types.Message, db_pool: asyncpg.Pool):
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     await process_and_save_knowledge(message.text, message, db_pool)
 
-# Обработчик файлов (PDF, TXT)
 @dp.message(AdminStates.upload_mode, F.document)
 async def handle_file_upload(message: types.Message, db_pool: asyncpg.Pool):
     document = message.document
     file_name = document.file_name.lower()
     
     if not (file_name.endswith('.txt') or file_name.endswith('.pdf')):
-        await message.answer("❌ Формат не поддерживается. Скинь файл .txt или .pdf")
+        await message.answer("❌ Нужен .txt или .pdf")
         return
         
-    await message.answer("⏳ Читаю документ, секунду...")
+    await message.answer("⏳ Анализирую файл...")
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
     file_in_memory = io.BytesIO()
@@ -177,20 +195,15 @@ async def handle_file_upload(message: types.Message, db_pool: asyncpg.Pool):
             await message.answer("⚠️ Файл пустой.")
             return
             
-        await message.answer(f"📖 Извлечено {len(extracted_text)} символов. Передаю в DeepSeek...")
         await process_and_save_knowledge(extracted_text, message, db_pool)
         
     except Exception as e:
-        await message.answer(f"❌ Не удалось прочитать файл: {e}")
+        await message.answer(f"❌ Ошибка чтения: {e}")
 
 async def main():
-    # Создаем пул один раз при старте приложения
     db_url = os.getenv("DATABASE_URL")
     pool = await asyncpg.create_pool(dsn=db_url, min_size=1, max_size=10)
-    
-    # Регистрируем пул в dispatcher, чтобы он автоматически передавался аргументом в хендлеры
     dp["db_pool"] = pool
-    
     try:
         await dp.start_polling(bot)
     finally:
