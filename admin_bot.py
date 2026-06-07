@@ -11,7 +11,7 @@ from openai import AsyncOpenAI
 import asyncpg
 from pypdf import PdfReader
 
-# Инициализация ИИ через OpenRouter на модель DeepSeek V4 Pro
+# Инициализация ИИ
 openai_client = AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=os.getenv("OPENROUTER_API_KEY")
@@ -45,22 +45,18 @@ async def enter_upload_mode(message: types.Message, state: FSMContext):
     await state.set_state(AdminStates.upload_mode)
     await message.answer(
         "Включен режим загрузки универсальных знаний. 📚\n\n"
-        "Сюда можно загружать абсолютно всё:\n"
-        "• Инструкции, книги, мануалы\n"
-        "• Скрипты, регламенты, бизнес-логику\n\n"
         "Форматы: обычный текст или файлы **.txt** / **.pdf**.\n"
         "Выход: /start"
     )
 
 @dp.message(F.text == "📊 Режим администрирования")
-async def enter_admin_mode(message: types.Message, state: FSMContext):
+async def enter_admin_mode(message: types.Message, state: FSMContext, db_pool: asyncpg.Pool):
+    # db_pool автоматически прокидывается из dp.workflow_data через middleware или напрямую
     await state.set_state(AdminStates.admin_mode)
-    db_url = os.getenv("DATABASE_URL")
     try:
-        conn = await asyncpg.connect(db_url)
-        nodes_count = await conn.fetchval("SELECT COUNT(*) FROM graph_nodes;")
-        edges_count = await conn.fetchval("SELECT COUNT(*) FROM graph_edges;")
-        await conn.close()
+        async with db_pool.acquire() as conn:
+            nodes_count = await conn.fetchval("SELECT COUNT(*) FROM graph_nodes;")
+            edges_count = await conn.fetchval("SELECT COUNT(*) FROM graph_edges;")
         
         await message.answer(
             f"📊 **Сводка из базы знаний:**\n\n"
@@ -71,15 +67,11 @@ async def enter_admin_mode(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"Ошибка подключения к базе: {e}")
 
-# Универсальный конвейер разбора и записи графа через DeepSeek
-async def process_and_save_knowledge(text_content: str, message: types.Message):
-    db_url = os.getenv("DATABASE_URL")
-    
-    # Промпт перенастроен на универсальное извлечение сущностей (не только продажи)
+# Универсальный конвейер разбора и записи графа
+async def process_and_save_knowledge(text_content: str, message: types.Message, db_pool: asyncpg.Pool):
     system_prompt = (
         "Ты — универсальный ИИ-архитектор графов знаний. Твоя задача — проанализировать входящий текст "
-        "(это может быть технический мануал, регламент, скрипт или книга) и разбить его на атомарные смысловые узлы "
-        "и логические связи между ними.\n\n"
+        "и разбить его на атомарные смысловые узлы и логические связи между ними.\n\n"
         "Типы узлов (node_type):\n"
         "- 'rule': жесткое правило, константа, инструкция, шаг алгоритма\n"
         "- 'objection': проблема, вводная ситуация, возражение, дефект, входящее условие\n"
@@ -87,13 +79,12 @@ async def process_and_save_knowledge(text_content: str, message: types.Message):
         "Ты должен вернуть ответ СТРОГО в формате JSON. Никакого другого текста вокруг.\n"
         "Формат JSON:\n"
         "{\n"
-        '  "nodes": [{"content": "краткое описание сути узла", "type": "rule" или "objection" или "technique"}],\n'
-        '  "edges": [{"source_index": 0, "target_index": 1, "relation_type": "описание причинно-следственной связи"}]\n'
+        '  "nodes": [{"content": "краткое описание сути узла", "type": "rule"||"objection"||"technique"}],\n'
+        '  "edges": [{"source_index": 0, "target_index": 1, "relation_type": "описание связи"}]\n'
         "}"
     )
     
     try:
-        # Подключаем киллер-фичу
         response = await openai_client.chat.completions.create(
             model="deepseek/deepseek-v4-pro",
             messages=[
@@ -104,49 +95,62 @@ async def process_and_save_knowledge(text_content: str, message: types.Message):
         )
         
         data = json.loads(response.choices[0].message.content)
-        conn = await asyncpg.connect(db_url)
-        inserted_node_ids = []
         
-        for node in data.get("nodes", []):
-            node_id = await conn.fetchval(
-                "INSERT INTO graph_nodes (content, node_type) VALUES ($1, $2) RETURNING id;",
-                node["content"], node["type"]
-            )
-            inserted_node_ids.append(node_id)
-            
-        edges_count = 0
-        for edge in data.get("edges", []):
-            src_idx = edge["source_index"]
-            tgt_idx = edge["target_index"]
-            
-            if src_idx < len(inserted_node_ids) and tgt_idx < len(inserted_node_ids):
-                await conn.execute(
-                    "INSERT INTO graph_edges (source_id, target_id, relation_type) VALUES ($1, $2, $3);",
-                    inserted_node_ids[src_idx], inserted_node_ids[tgt_idx], edge["relation_type"]
-                )
-                edges_count += 1
+        # Берём соединение из пула и открываем атомарную транзакцию
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                inserted_node_ids = []
                 
-        await conn.close()
-        
+                # 1. Вставка узлов с защитой от дубликатов (требуется UNIQUE UNIQUE(content) в базе)
+                for node in data.get("nodes", []):
+                    # Если узел с таким content уже есть, берем его id, иначе вставляем новый
+                    node_id = await conn.fetchval(
+                        """
+                        INSERT INTO graph_nodes (content, node_type) 
+                        VALUES ($1, $2) 
+                        ON CONFLICT (content) DO UPDATE SET node_type = EXCLUDED.node_type
+                        RETURNING id;
+                        """,
+                        node["content"], node["type"]
+                    )
+                    inserted_node_ids.append(node_id)
+                    
+                edges_count = 0
+                # 2. Вставка связей
+                for edge in data.get("edges", []):
+                    src_idx = edge["source_index"]
+                    tgt_idx = edge["target_index"]
+                    
+                    if src_idx < len(inserted_node_ids) and tgt_idx < len(inserted_node_ids):
+                        # Защита от дублирования связей
+                        await conn.execute(
+                            """
+                            INSERT INTO graph_edges (source_id, target_id, relation_type) 
+                            VALUES ($1, $2, $3)
+                            ON CONFLICT (source_id, target_id, relation_type) DO NOTHING;
+                            """,
+                            inserted_node_ids[src_idx], inserted_node_ids[tgt_idx], edge["relation_type"]
+                        )
+                        edges_count += 1
+                        
         await message.answer(
-            f"🚀 **Киллер-фича отработала успешно!**\n"
-            f"Данные внесены в архитектуру графа.\n\n"
-            f"• Выделено смысловых блоков: {len(inserted_node_ids)}\n"
-            f"• Найдено логических связей: {edges_count}"
+            f"🚀 **Данные успешно интегрированы в граф!**\n\n"
+            f"• Обработано смысловых блоков: {len(inserted_node_ids)}\n"
+            f"• Сформировано связей: {edges_count}"
         )
         
     except Exception as e:
-        await message.answer(f"⚠️ Ошибка на стороне DeepSeek или Базы: {e}")
+        await message.answer(f"⚠️ Ошибка обработки: {e}")
 
 # Обработчик текста
 @dp.message(AdminStates.upload_mode, F.text)
-async def handle_text_upload(message: types.Message):
+async def handle_text_upload(message: types.Message, db_pool: asyncpg.Pool):
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    await process_and_save_knowledge(message.text, message)
+    await process_and_save_knowledge(message.text, message, db_pool)
 
 # Обработчик файлов (PDF, TXT)
 @dp.message(AdminStates.upload_mode, F.document)
-async def handle_file_upload(message: types.Message):
+async def handle_file_upload(message: types.Message, db_pool: asyncpg.Pool):
     document = message.document
     file_name = document.file_name.lower()
     
@@ -162,32 +166,37 @@ async def handle_file_upload(message: types.Message):
     file_in_memory.seek(0)
     
     extracted_text = ""
-    
     try:
         if file_name.endswith('.txt'):
             extracted_text = file_in_memory.read().decode('utf-8', errors='ignore')
-            
         elif file_name.endswith('.pdf'):
             pdf_reader = PdfReader(file_in_memory)
-            text_parts = []
-            for page in pdf_reader.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text_parts.append(page_text)
-            extracted_text = "\n".join(text_parts)
+            extracted_text = "\n".join([page.extract_text() or "" for page in pdf_reader.pages])
             
         if not extracted_text.strip():
-            await message.answer("⚠️ Файл пустой или содержит только картинки.")
+            await message.answer("⚠️ Файл пустой.")
             return
             
-        await message.answer(f"📖 Успешно извлечено {len(extracted_text)} символов. Передаю в DeepSeek V4 Pro...")
-        await process_and_save_knowledge(extracted_text, message)
+        await message.answer(f"📖 Извлечено {len(extracted_text)} символов. Передаю в DeepSeek...")
+        
+        # TODO: Если текст > 8000 символов, желательно разбивать на чанки!
+        await process_and_save_knowledge(extracted_text, message, db_pool)
         
     except Exception as e:
         await message.answer(f"❌ Не удалось прочитать файл: {e}")
 
 async def main():
-    await dp.start_polling(bot)
+    # Инициализируем пул подключений к БД один раз при старте
+    db_url = os.getenv("DATABASE_URL")
+    pool = await asyncpg.create_pool(dsn=db_url, min_size=1, max_size=10)
+    
+    # Передаем пул в workflow_data, чтобы aiogram автоматически прокидывал его в хендлеры как `db_pool`
+    dp["db_pool"] = pool
+    
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await pool.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
