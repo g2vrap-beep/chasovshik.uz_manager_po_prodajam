@@ -1,0 +1,5 @@
+aiogram==3.28.2
+openai>=1.30.0
+psycopg2-binary>=2.9.9
+asyncpg>=0.29.0
+python-dotenv>=1.0.1
