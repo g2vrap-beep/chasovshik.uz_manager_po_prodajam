@@ -1,6 +1,7 @@
 import os
 import asyncio
 import json
+import io
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.fsm.state import State, StatesGroup
@@ -8,6 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from openai import AsyncOpenAI
 import asyncpg
+from pypdf import PdfReader
 
 # Инициализация ИИ через OpenRouter
 openai_client = AsyncOpenAI(
@@ -42,17 +44,17 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def enter_upload_mode(message: types.Message, state: FSMContext):
     await state.set_state(AdminStates.upload_mode)
     await message.answer(
-        "Включен режим загрузки знаний. 📚\n"
-        "Отправь мне правило, цитату или скрипт продаж. "
-        "Я проанализирую текст через Claude Sonnet и сохраню граф связей в базу.\n\n"
+        "Включен режим загрузки знаний. 📚\n\n"
+        "Ты можешь:\n"
+        "1. Отправить текст сообщением\n"
+        "2. Прикрепить файл **.txt** или **.pdf**\n\n"
+        "Я вытащу из документа суть через Claude Sonnet и сохраню граф в базу.\n"
         "Выход: /start"
     )
 
 @dp.message(F.text == "📊 Режим администрирования")
 async def enter_admin_mode(message: types.Message, state: FSMContext):
     await state.set_state(AdminStates.admin_mode)
-    
-    # Считаем реальное количество знаний в базе через SQL
     db_url = os.getenv("DATABASE_URL")
     try:
         conn = await asyncpg.connect(db_url)
@@ -64,22 +66,17 @@ async def enter_admin_mode(message: types.Message, state: FSMContext):
             f"📊 **Сводка из базы знаний:**\n\n"
             f"• Загружено правил/узлов: {nodes_count}\n"
             f"• Создано связей между ними: {edges_count}\n\n"
-            f"Сводка по клиентам из CRM будет доступна после подключения клиентского модуля.\n\n"
             f"Выход: /start"
         )
     except Exception as e:
         await message.answer(f"Ошибка подключения к базе: {e}")
 
-# ЛОГИКА АВТОМАТИЧЕСКОГО РАЗБОРА И ЗАПИСИ ГРАФА
-@dp.message(AdminStates.upload_mode)
-async def handle_upload(message: types.Message):
-    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    user_text = message.text
+# Функция обработки текста и записи в БД
+async def process_and_save_knowledge(text_content: str, message: types.Message):
     db_url = os.getenv("DATABASE_URL")
     
-    # Просим Sonnet вернуть СТРОГИЙ JSON формат
     system_prompt = (
-        "Ты — ИИ-архитектор графов знаний. Твоя задача — выделить из текста правила, возражения и техники, "
+        "Ты — ИИ-архитектор графов знаний. Твоя задача — выделить из присланного текста правила, возражения и техники, "
         "а также связи между ними. Ты должен вернуть ответ СТРОГО в формате JSON. Никакого другого текста вокруг.\n"
         "Формат JSON:\n"
         "{\n"
@@ -93,18 +90,15 @@ async def handle_upload(message: types.Message):
             model="anthropic/claude-3.5-sonnet",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Разбери этот текст на граф:\n\n{user_text}"}
+                {"role": "user", "content": f"Разбери этот текст на граф:\n\n{text_content}"}
             ],
-            response_format={"type": "json_object"} # Гарантирует JSON на выходе
+            response_format={"type": "json_object"}
         )
         
-        # Парсим то, что прислал Sonnet
         data = json.loads(response.choices[0].message.content)
-        
         conn = await asyncpg.connect(db_url)
         inserted_node_ids = []
         
-        # 1. Записываем узлы (Nodes)
         for node in data.get("nodes", []):
             node_id = await conn.fetchval(
                 "INSERT INTO graph_nodes (content, node_type) VALUES ($1, $2) RETURNING id;",
@@ -112,13 +106,11 @@ async def handle_upload(message: types.Message):
             )
             inserted_node_ids.append(node_id)
             
-        # 2. Записываем связи (Edges), используя сохраненные ID
         edges_count = 0
         for edge in data.get("edges", []):
             src_idx = edge["source_index"]
             tgt_idx = edge["target_index"]
             
-            # Проверяем, что индексы корректны
             if src_idx < len(inserted_node_ids) and tgt_idx < len(inserted_node_ids):
                 await conn.execute(
                     "INSERT INTO graph_edges (source_id, target_id, relation_type) VALUES ($1, $2, $3);",
@@ -129,15 +121,63 @@ async def handle_upload(message: types.Message):
         await conn.close()
         
         await message.answer(
-            f"✅ **Успешно загружено в базу!**\n\n"
+            f"✅ **Документ успешно обработан и внесен в базу!**\n\n"
             f" Сохранено новых узлов: {len(inserted_node_ids)}\n"
-            f" Создано связей между ними: {edges_count}\n\n"
-            f"Ты можешь проверить их в Railway во вкладке Data."
+            f" Создано связей между ними: {edges_count}"
         )
         
     except Exception as e:
-        await message.answer(f"⚠️ Произошла ошибка при обработке: {e}")
+        await message.answer(f"⚠️ Произошла ошибка при обработке ИИ: {e}")
 
+# Обработчик текстовых сообщений
+@dp.message(AdminStates.upload_mode, F.text)
+async def handle_text_upload(message: types.Message):
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    await process_and_save_knowledge(message.text, message)
+
+# Обработчик файлов (PDF, TXT)
+@dp.message(AdminStates.upload_mode, F.document)
+async def handle_file_upload(message: types.Message):
+    document = message.document
+    file_name = document.file_name.lower()
+    
+    if not (file_name.endswith('.txt') or file_name.endswith('.pdf')):
+        await message.answer("❌ Я принимаю только файлы форматов .txt или .pdf")
+        return
+        
+    await message.answer("⏳ Скачиваю и читаю файл, подожди немного...")
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    
+    file_in_memory = io.BytesIO()
+    await bot.download(document, destination=file_in_memory)
+    file_in_memory.seek(0)
+    
+    extracted_text = ""
+    
+    try:
+        if file_name.endswith('.txt'):
+            extracted_text = file_in_memory.read().decode('utf-8', errors='ignore')
+            
+        elif file_name.endswith('.pdf'):
+            pdf_reader = PdfReader(file_in_memory)
+            text_parts = []
+            for page in pdf_reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text_parts.append(page_text)
+            extracted_text = "\n".join(text_parts)
+            
+        if not extracted_text.strip():
+            await message.answer("⚠️ Не удалось извлечь текст из файла.")
+            return
+            
+        await message.answer(f"📖 Успешно прочитано {len(extracted_text)} символов. Передаю в Claude Sonnet...")
+        await process_and_save_knowledge(extracted_text, message)
+        
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при чтении файла: {e}")
+
+# ВОТ ТУТ ОШИБКА ИСПРАВЛЕНА: добавлено ключевое слово "def"
 async def main():
     await dp.start_polling(bot)
 
