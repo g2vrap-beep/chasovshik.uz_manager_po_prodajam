@@ -11,7 +11,7 @@ from openai import AsyncOpenAI
 import asyncpg
 from pypdf import PdfReader
 
-# Инициализация ИИ через OpenRouter
+# Инициализация ИИ через OpenRouter на модель DeepSeek V4 Pro
 openai_client = AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=os.getenv("OPENROUTER_API_KEY")
@@ -36,7 +36,7 @@ def get_main_keyboard():
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.set_state(AdminStates.main_menu)
     await message.answer(
-        "Привет, Шеф! Система готова. Выбери режим работы:",
+        "Привет, Шеф! Универсальная система управления знаниями готова. Выбери режим работы:",
         reply_markup=get_main_keyboard()
     )
 
@@ -44,11 +44,11 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def enter_upload_mode(message: types.Message, state: FSMContext):
     await state.set_state(AdminStates.upload_mode)
     await message.answer(
-        "Включен режим загрузки знаний. 📚\n\n"
-        "Ты можешь:\n"
-        "1. Отправить текст сообщением\n"
-        "2. Прикрепить файл **.txt** или **.pdf**\n\n"
-        "Я вытащу из документа суть через Claude Sonnet и сохраню граф в базу.\n"
+        "Включен режим загрузки универсальных знаний. 📚\n\n"
+        "Сюда можно загружать абсолютно всё:\n"
+        "• Инструкции, книги, мануалы\n"
+        "• Скрипты, регламенты, бизнес-логику\n\n"
+        "Форматы: обычный текст или файлы **.txt** / **.pdf**.\n"
         "Выход: /start"
     )
 
@@ -64,33 +64,41 @@ async def enter_admin_mode(message: types.Message, state: FSMContext):
         
         await message.answer(
             f"📊 **Сводка из базы знаний:**\n\n"
-            f"• Загружено правил/узлов: {nodes_count}\n"
-            f"• Создано связей между ними: {edges_count}\n\n"
+            f"• Всего концептов/узлов в базе: {nodes_count}\n"
+            f"• Логических связей между ними: {edges_count}\n\n"
             f"Выход: /start"
         )
     except Exception as e:
         await message.answer(f"Ошибка подключения к базе: {e}")
 
-# Функция обработки текста и записи в БД
+# Универсальный конвейер разбора и записи графа через DeepSeek
 async def process_and_save_knowledge(text_content: str, message: types.Message):
     db_url = os.getenv("DATABASE_URL")
     
+    # Промпт перенастроен на универсальное извлечение сущностей (не только продажи)
     system_prompt = (
-        "Ты — ИИ-архитектор графов знаний. Твоя задача — выделить из присланного текста правила, возражения и техники, "
-        "а также связи между ними. Ты должен вернуть ответ СТРОГО в формате JSON. Никакого другого текста вокруг.\n"
+        "Ты — универсальный ИИ-архитектор графов знаний. Твоя задача — проанализировать входящий текст "
+        "(это может быть технический мануал, регламент, скрипт или книга) и разбить его на атомарные смысловые узлы "
+        "и логические связи между ними.\n\n"
+        "Типы узлов (node_type):\n"
+        "- 'rule': жесткое правило, константа, инструкция, шаг алгоритма\n"
+        "- 'objection': проблема, вводная ситуация, возражение, дефект, входящее условие\n"
+        "- 'technique': метод решения, способ отработки, действие, техника выполнения\n\n"
+        "Ты должен вернуть ответ СТРОГО в формате JSON. Никакого другого текста вокруг.\n"
         "Формат JSON:\n"
         "{\n"
-        '  "nodes": [{"content": "текст узла", "type": "rule" или "objection" или "technique"}],\n'
-        '  "edges": [{"source_index": 0, "target_index": 1, "relation_type": "описание связи"}]\n'
+        '  "nodes": [{"content": "краткое описание сути узла", "type": "rule" или "objection" или "technique"}],\n'
+        '  "edges": [{"source_index": 0, "target_index": 1, "relation_type": "описание причинно-следственной связи"}]\n'
         "}"
     )
     
     try:
+        # Подключаем киллер-фичу
         response = await openai_client.chat.completions.create(
-            model="anthropic/claude-3.5-sonnet",
+            model="deepseek/deepseek-v4-pro",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Разбери этот текст на граф:\n\n{text_content}"}
+                {"role": "user", "content": f"Разбери этот текст на универсальный граф:\n\n{text_content}"}
             ],
             response_format={"type": "json_object"}
         )
@@ -121,15 +129,16 @@ async def process_and_save_knowledge(text_content: str, message: types.Message):
         await conn.close()
         
         await message.answer(
-            f"✅ **Документ успешно обработан и внесен в базу!**\n\n"
-            f" Сохранено новых узлов: {len(inserted_node_ids)}\n"
-            f" Создано связей между ними: {edges_count}"
+            f"🚀 **Киллер-фича отработала успешно!**\n"
+            f"Данные внесены в архитектуру графа.\n\n"
+            f"• Выделено смысловых блоков: {len(inserted_node_ids)}\n"
+            f"• Найдено логических связей: {edges_count}"
         )
         
     except Exception as e:
-        await message.answer(f"⚠️ Произошла ошибка при обработке ИИ: {e}")
+        await message.answer(f"⚠️ Ошибка на стороне DeepSeek или Базы: {e}")
 
-# Обработчик текстовых сообщений
+# Обработчик текста
 @dp.message(AdminStates.upload_mode, F.text)
 async def handle_text_upload(message: types.Message):
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
@@ -142,10 +151,10 @@ async def handle_file_upload(message: types.Message):
     file_name = document.file_name.lower()
     
     if not (file_name.endswith('.txt') or file_name.endswith('.pdf')):
-        await message.answer("❌ Я принимаю только файлы форматов .txt или .pdf")
+        await message.answer("❌ Формат не поддерживается. Скинь файл .txt или .pdf")
         return
         
-    await message.answer("⏳ Скачиваю и читаю файл, подожди немного...")
+    await message.answer("⏳ Читаю документ, секунду...")
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
     file_in_memory = io.BytesIO()
@@ -168,16 +177,15 @@ async def handle_file_upload(message: types.Message):
             extracted_text = "\n".join(text_parts)
             
         if not extracted_text.strip():
-            await message.answer("⚠️ Не удалось извлечь текст из файла.")
+            await message.answer("⚠️ Файл пустой или содержит только картинки.")
             return
             
-        await message.answer(f"📖 Успешно прочитано {len(extracted_text)} символов. Передаю в Claude Sonnet...")
+        await message.answer(f"📖 Успешно извлечено {len(extracted_text)} символов. Передаю в DeepSeek V4 Pro...")
         await process_and_save_knowledge(extracted_text, message)
         
     except Exception as e:
-        await message.answer(f"❌ Ошибка при чтении файла: {e}")
+        await message.answer(f"❌ Не удалось прочитать файл: {e}")
 
-# ВОТ ТУТ ОШИБКА ИСПРАВЛЕНА: добавлено ключевое слово "def"
 async def main():
     await dp.start_polling(bot)
 
