@@ -2,9 +2,9 @@ import os
 import asyncio
 import json
 import io
-from datetime import datetime, timezone  # Изменение: добавили для работы со временем подписок
+from datetime import datetime, timezone
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command  # Изменение: добавили Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
@@ -36,7 +36,7 @@ def get_main_keyboard():
     builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
 
-# 📄 Меню режима загрузки (Reply-кнопки)
+# Меню режима загрузки (Reply-кнопки)
 def get_upload_keyboard():
     builder = ReplyKeyboardBuilder()
     builder.button(text="⬅️ Назад в меню")
@@ -59,7 +59,7 @@ async def get_unique_files(conn) -> list:
     """)
     return sorted([r['source_file'] for r in rows])
 
-# Функция создания вектора (эмбеддинга) смысла текста
+# Функция создания векатора (эмбеддинга) смысла текста
 async def get_embedding(text: str) -> list:
     try:
         response = await openai_client.embeddings.create(
@@ -72,7 +72,7 @@ async def get_embedding(text: str) -> list:
         return []
 
 
-# ================= ОБНОВЛЕННЫЙ ХЕНДЛЕР СТАРТА (ЭТАП 1) =================
+# ================= ХЕНДЛЕР СТАРТА =================
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext, db_pool: asyncpg.Pool):
@@ -80,7 +80,6 @@ async def cmd_start(message: types.Message, state: FSMContext, db_pool: asyncpg.
     
     try:
         async with db_pool.acquire() as conn:
-            # Запрашиваем данные админа и его компании одной связкой
             user_info = await conn.fetchrow("""
                 SELECT a.role, a.company_id, c.company_name, c.subscription_expires_at 
                 FROM admin_users a
@@ -91,7 +90,6 @@ async def cmd_start(message: types.Message, state: FSMContext, db_pool: asyncpg.
         await message.answer(f"❌ Ошибка подключения к базе данных: {e}")
         return
         
-    # Защита 1: Если пользователя вообще нет в таблице admin_users
     if not user_info:
         await message.answer("❌ **Доступ заблокирован.**\nВы не зарегистрированы в системе как администратор платформы.")
         return
@@ -100,11 +98,8 @@ async def cmd_start(message: types.Message, state: FSMContext, db_pool: asyncpg.
     company_name = user_info['company_name']
     expires_at = user_info['subscription_expires_at']
 
-    # Защита 2: Проверка окончания триала / подписки (пропускаем только создателя с супер-ролью)
     if role not in ["superadmin", "super_admin"]:
-        # Синхронизируем таймзоны (база обычно отдает с tzinfo)
         now = datetime.now(timezone.utc) if expires_at and expires_at.tzinfo else datetime.now()
-        
         if expires_at and expires_at < now:
             await message.answer(
                 f"❌ **Доступ ограничен!**\n\n"
@@ -114,7 +109,6 @@ async def cmd_start(message: types.Message, state: FSMContext, db_pool: asyncpg.
             )
             return
 
-    # Если проверки пройдены — сохраняем метаданные в сессию FSM
     await state.update_data(
         company_id=user_info['company_id'],
         role=role,
@@ -129,6 +123,82 @@ async def cmd_start(message: types.Message, state: FSMContext, db_pool: asyncpg.
         f"Выбери режим работы:", 
         reply_markup=get_main_keyboard()
     )
+
+
+# ================= СЕКРЕТНАЯ КОМАНДА СУПЕР-АДМИНА (ЭТАП 2) =================
+
+@dp.message(Command("grant"))
+async def cmd_grant_days(message: types.Message, db_pool: asyncpg.Pool):
+    try:
+        async with db_pool.acquire() as conn:
+            # Проверяем роль создателя напрямую в базе данных ради безопасности
+            role = await conn.fetchval("SELECT role FROM admin_users WHERE telegram_id = $1;", message.from_user.id)
+            
+            # Если не супер-админ — бот тотально игнорирует команду
+            if role not in ["superadmin", "super_admin"]:
+                return
+
+            # Парсим аргументы: /grant self 30 или /grant 5 14
+            args = message.text.split()[1:]
+            if len(args) != 2:
+                await message.answer(
+                    "⚠️ **Неверный формат команды!**\n\n"
+                    "Используй так:\n"
+                    "• `/grant self 30` — выдать своей компании 30 дней\n"
+                    "• `/grant 5 14` — выдать компании с ID 5 триал на 14 дней",
+                    parse_mode="Markdown"
+                )
+                return
+                
+            target, days_str = args[0], args[1]
+            
+            if not days_str.isdigit():
+                await message.answer("❌ Количество дней должно быть целым числом.")
+                return
+                
+            days = int(days_str)
+            
+            # Если цель self — определяем ID компании этого супер-админа
+            if target.lower() == "self":
+                company_id = await conn.fetchval("SELECT company_id FROM admin_users WHERE telegram_id = $1;", message.from_user.id)
+                if not company_id:
+                    await message.answer("❌ Ошибка: у вашей учетной записи не привязан ID компании.")
+                    return
+            else:
+                if not target.isdigit():
+                    await message.answer("❌ ID компании должно быть числом или ключевым словом `self`.")
+                    return
+                company_id = int(target)
+
+            # Проверяем, жива ли вообще такая компания
+            company_name = await conn.fetchval("SELECT company_name FROM companies WHERE id = $1;", company_id)
+            if not company_name:
+                await message.answer(f"❌ Компания с ID `{company_id}` не найдена в системе.")
+                return
+            
+            # Магия SQL: если подписка активна — плюсуем к ней, если сгорела — отсчитываем заново от NOW()
+            await conn.execute("""
+                UPDATE companies 
+                SET subscription_expires_at = CASE 
+                    WHEN subscription_expires_at > CURRENT_TIMESTAMP THEN subscription_expires_at + ($1 || ' days')::INTERVAL 
+                    ELSE CURRENT_TIMESTAMP + ($1 || ' days')::INTERVAL 
+                END
+                WHERE id = $2;
+            """, days, company_id)
+            
+            # Берем обновленное время для отчета
+            new_expire_date = await conn.fetchval("SELECT subscription_expires_at FROM companies WHERE id = $1;", company_id)
+            formatted_date = new_expire_date.strftime('%d.%m.%Y %H:%M')
+
+        await message.answer(
+            f"👑 **Власть над временем успешно применена!**\n\n"
+            f"🏢 Компания: **{company_name}** (ID: {company_id})\n"
+            f"➕ Добавлено дней: `{days}`\n"
+            f"📅 Новая дата окончания доступа: **{formatted_date}**"
+        )
+        
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при изменении времени подписки: {e}")
 
 
 # ================= РЕЖИМЫ РАБОТЫ И КОНВЕЙЕРЫ (БЕЗ ИЗМЕНЕНИЙ) =================
@@ -224,7 +294,6 @@ async def process_and_save_knowledge(text_content: str, message: types.Message, 
                 if existing_node_id:
                     inserted_node_ids.append(existing_node_id)
                 else:
-                    # Записываем новый узел и помечаем, из какого он файла
                     node_id = await conn.fetchval(
                         """
                         INSERT INTO graph_nodes (content, node_type, embedding, source_file) 
@@ -242,7 +311,6 @@ async def process_and_save_knowledge(text_content: str, message: types.Message, 
                 tgt_idx = edge["target_index"]
                 
                 if src_idx < len(inserted_node_ids) and tgt_idx < len(inserted_node_ids):
-                    # Записываем связь и помечаем, к какому файлу она относится
                     await conn.execute(
                         """
                         INSERT INTO graph_edges (source_id, target_id, relation_type, source_file) 
