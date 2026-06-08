@@ -4,7 +4,7 @@ import json
 import io
 from datetime import datetime, timezone
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart, Command  # Изменение: добавили Command
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
@@ -59,7 +59,7 @@ async def get_unique_files(conn) -> list:
     """)
     return sorted([r['source_file'] for r in rows])
 
-# Функция создания векатора (эмбеддинга) смысла текста
+# Функция создания вектора (эмбеддинга) смысла текста
 async def get_embedding(text: str) -> list:
     try:
         response = await openai_client.embeddings.create(
@@ -125,20 +125,17 @@ async def cmd_start(message: types.Message, state: FSMContext, db_pool: asyncpg.
     )
 
 
-# ================= СЕКРЕТНАЯ КОМАНДА СУПЕР-АДМИНА (ЭТАП 2) =================
+# ================= ИСПРАВЛЕННАЯ КОМАНДА СУПЕР-АДМИНА =================
 
 @dp.message(Command("grant"))
 async def cmd_grant_days(message: types.Message, db_pool: asyncpg.Pool):
     try:
         async with db_pool.acquire() as conn:
-            # Проверяем роль создателя напрямую в базе данных ради безопасности
             role = await conn.fetchval("SELECT role FROM admin_users WHERE telegram_id = $1;", message.from_user.id)
             
-            # Если не супер-админ — бот тотально игнорирует команду
             if role not in ["superadmin", "super_admin"]:
                 return
 
-            # Парсим аргументы: /grant self 30 или /grant 5 14
             args = message.text.split()[1:]
             if len(args) != 2:
                 await message.answer(
@@ -158,7 +155,6 @@ async def cmd_grant_days(message: types.Message, db_pool: asyncpg.Pool):
                 
             days = int(days_str)
             
-            # Если цель self — определяем ID компании этого супер-админа
             if target.lower() == "self":
                 company_id = await conn.fetchval("SELECT company_id FROM admin_users WHERE telegram_id = $1;", message.from_user.id)
                 if not company_id:
@@ -170,23 +166,21 @@ async def cmd_grant_days(message: types.Message, db_pool: asyncpg.Pool):
                     return
                 company_id = int(target)
 
-            # Проверяем, жива ли вообще такая компания
             company_name = await conn.fetchval("SELECT company_name FROM companies WHERE id = $1;", company_id)
             if not company_name:
                 await message.answer(f"❌ Компания с ID `{company_id}` не найдена в системе.")
                 return
             
-            # Магия SQL: если подписка активна — плюсуем к ней, если сгорела — отсчитываем заново от NOW()
+            # ИСПРАВЛЕНО: используем математическое умножение интервала ($1 * INTERVAL '1 day') вместо склеивания строк
             await conn.execute("""
                 UPDATE companies 
                 SET subscription_expires_at = CASE 
-                    WHEN subscription_expires_at > CURRENT_TIMESTAMP THEN subscription_expires_at + ($1 || ' days')::INTERVAL 
-                    ELSE CURRENT_TIMESTAMP + ($1 || ' days')::INTERVAL 
+                    WHEN subscription_expires_at > CURRENT_TIMESTAMP THEN subscription_expires_at + ($1 * INTERVAL '1 day')
+                    ELSE CURRENT_TIMESTAMP + ($1 * INTERVAL '1 day')
                 END
                 WHERE id = $2;
             """, days, company_id)
             
-            # Берем обновленное время для отчета
             new_expire_date = await conn.fetchval("SELECT subscription_expires_at FROM companies WHERE id = $1;", company_id)
             formatted_date = new_expire_date.strftime('%d.%m.%Y %H:%M')
 
