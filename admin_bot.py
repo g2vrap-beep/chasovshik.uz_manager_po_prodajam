@@ -20,16 +20,25 @@ openai_client = AsyncOpenAI(
 bot = Bot(token=os.getenv("TELEGRAM_ADMIN_TOKEN"))
 dp = Dispatcher()
 
+# Состояния FSM
 class AdminStates(StatesGroup):
     main_menu = State()
     upload_mode = State()
+    processing = State()  # Состояние жесткой блокировки процессов
     admin_mode = State()
 
+# Главное меню
 def get_main_keyboard():
     builder = ReplyKeyboardBuilder()
     builder.button(text="📥 Режим загрузки")
     builder.button(text="📊 Режим admin-панели")
     builder.adjust(2)
+    return builder.as_markup(resize_keyboard=True)
+
+# Меню режима загрузки
+def get_upload_keyboard():
+    builder = ReplyKeyboardBuilder()
+    builder.button(text="⬅️ Назад в меню")
     return builder.as_markup(resize_keyboard=True)
 
 # Функция создания вектора (эмбеддинга) смысла текста
@@ -44,16 +53,25 @@ async def get_embedding(text: str) -> list:
         print(f"Ошибка генерации эмбеддинга: {e}")
         return []
 
+# Хендлер команды /start
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.set_state(AdminStates.main_menu)
     await message.answer("Система управления знаниями запущена. Выбери режим:", reply_markup=get_main_keyboard())
 
+# Вход в режим загрузки
 @dp.message(F.text == "📥 Режим загрузки")
 async def enter_upload_mode(message: types.Message, state: FSMContext):
     await state.set_state(AdminStates.upload_mode)
-    await message.answer("Режим загрузки активирован. Отправь текст или .pdf/.txt файл. Выход: /start")
+    await message.answer("Режим загрузки активирован. Отправь текст или .pdf/.txt файл.", reply_markup=get_upload_keyboard())
 
+# Возврат из режима загрузки в главное меню
+@dp.message(AdminStates.upload_mode, F.text == "⬅️ Назад в меню")
+async def back_to_main(message: types.Message, state: FSMContext):
+    await state.set_state(AdminStates.main_menu)
+    await message.answer("Вы вернулись в главное меню.", reply_markup=get_main_keyboard())
+
+# Вход в админ-панель
 @dp.message(F.text == "📊 Режим admin-панели")
 async def enter_admin_mode(message: types.Message, state: FSMContext, db_pool: asyncpg.Pool):
     await state.set_state(AdminStates.admin_mode)
@@ -64,6 +82,15 @@ async def enter_admin_mode(message: types.Message, state: FSMContext, db_pool: a
         await message.answer(f"📊 **База знаний:**\n• Узлов: {nodes_count}\n• Связей: {edges_count}\n\nВыход: /start")
     except Exception as e:
         await message.answer(f"Ошибка БД: {e}")
+
+# ХЕНДЛЕР-ЗАГЛУШКА: блокирует любые действия пользователя во время обработки ИИ
+@dp.message(AdminStates.processing)
+async def handle_processing_lock(message: types.Message):
+    await message.answer(
+        "⚠️ **Пожалуйста, подождите!**\n"
+        "Прямо сейчас я анализирую прошлые данные и строю граф знаний. "
+        "Как только я закончу, я сразу вам сообщу!"
+    )
 
 # Конвейер разбора и векторной записи графа
 async def process_and_save_knowledge(text_content: str, message: types.Message, db_pool: asyncpg.Pool):
@@ -82,92 +109,96 @@ async def process_and_save_knowledge(text_content: str, message: types.Message, 
         "}"
     )
     
-    try:
-        response = await openai_client.chat.completions.create(
-            model="deepseek/deepseek-v4-pro",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Разбери текст на граф:\n\n{text_content}"}
-            ],
-            response_format={"type": "json_object"}
-        )
-        
-        data = json.loads(response.choices[0].message.content)
-        
-        async with db_pool.acquire() as conn:
-            async with conn.transaction():
-                inserted_node_ids = []
-                
-                # Обработка Узлов
-                for node in data.get("nodes", []):
-                    content = node["content"]
-                    node_type = node["type"]
-                    
-                    # Получаем вектор смысла для текущего узла
-                    embedding = await get_embedding(content)
-                    
-                    existing_node_id = None
-                    if embedding:
-                        # Ищем в базе узел, схожесть с которым выше 70% (0.70)
-                        existing_node_id = await conn.fetchval(
-                            """
-                            SELECT id FROM graph_nodes 
-                            WHERE 1 - (embedding <=> $1::vector) > 0.70 
-                            ORDER BY embedding <=> $1::vector 
-                            LIMIT 1;
-                            """,
-                            str(embedding)
-                        )
-                    
-                    if existing_node_id:
-                        # Если похожий по смыслу узел найден — используем его ID (не создаем дубль!)
-                        inserted_node_ids.append(existing_node_id)
-                    else:
-                        # Если это принципиально новая мысль — записываем её и её вектор
-                        node_id = await conn.fetchval(
-                            """
-                            INSERT INTO graph_nodes (content, node_type, embedding) 
-                            VALUES ($1, $2, $3::vector) 
-                            RETURNING id;
-                            """,
-                            content, node_type, str(embedding)
-                        )
-                        inserted_node_ids.append(node_id)
-                        
-                edges_count = 0
-                # Обработка Связей
-                for edge in data.get("edges", []):
-                    src_idx = edge["source_index"]
-                    tgt_idx = edge["target_index"]
-                    
-                    if src_idx < len(inserted_node_ids) and tgt_idx < len(inserted_node_ids):
-                        await conn.execute(
-                            """
-                            INSERT INTO graph_edges (source_id, target_id, relation_type) 
-                            VALUES ($1, $2, $3)
-                            ON CONFLICT DO NOTHING;
-                            """,
-                            inserted_node_ids[src_idx], inserted_node_ids[tgt_idx], edge["relation_type"]
-                        )
-                        edges_count += 1
-                        
-            await message.answer(
-                f"🚀 **Векторная интеграция завершена!**\n\n"
-                f"• Обработано блоков: {len(inserted_node_ids)}\n"
-                f"• Проверено/создано связей: {edges_count}"
-            )
+    response = await openai_client.chat.completions.create(
+        model="deepseek/deepseek-v4-pro",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Разбери текст на граф:\n\n{text_content}"}
+        ],
+        response_format={"type": "json_object"}
+    )
+    
+    data = json.loads(response.choices[0].message.content)
+    
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            inserted_node_ids = []
             
+            # Обработка Узлов
+            for node in data.get("nodes", []):
+                content = node["content"]
+                node_type = node["type"]
+                
+                embedding = await get_embedding(content)
+                existing_node_id = None
+                
+                if embedding:
+                    existing_node_id = await conn.fetchval(
+                        """
+                        SELECT id FROM graph_nodes 
+                        WHERE 1 - (embedding <=> $1::vector) > 0.70 
+                        ORDER BY embedding <=> $1::vector 
+                        LIMIT 1;
+                        """,
+                        str(embedding)
+                    )
+                
+                if existing_node_id:
+                    inserted_node_ids.append(existing_node_id)
+                else:
+                    node_id = await conn.fetchval(
+                        """
+                        INSERT INTO graph_nodes (content, node_type, embedding) 
+                        VALUES ($1, $2, $3::vector) 
+                        RETURNING id;
+                        """,
+                        content, node_type, str(embedding)
+                    )
+                    inserted_node_ids.append(node_id)
+                    
+            edges_count = 0
+            # Обработка Связей
+            for edge in data.get("edges", []):
+                src_idx = edge["source_index"]
+                tgt_idx = edge["target_index"]
+                
+                if src_idx < len(inserted_node_ids) and tgt_idx < len(inserted_node_ids):
+                    await conn.execute(
+                        """
+                        INSERT INTO graph_edges (source_id, target_id, relation_type) 
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT DO NOTHING;
+                        """,
+                        inserted_node_ids[src_idx], inserted_node_ids[tgt_idx], edge["relation_type"]
+                    )
+                    edges_count += 1
+                    
+        await message.answer(
+            f"🚀 **Векторная интеграция части завершена!**\n"
+            f"• Обработано блоков: {len(inserted_node_ids)}\n"
+            f"• Проверено/создано связей: {edges_count}"
+        )
+
+# Хендлер загрузки чистого ТЕКСТА
+@dp.message(AdminStates.upload_mode, F.text)
+async def handle_text_upload(message: types.Message, state: FSMContext, db_pool: asyncpg.Pool):
+    # Включаем блокировку процессов
+    await state.set_state(AdminStates.processing)
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    
+    try:
+        await process_and_save_knowledge(message.text, message, db_pool)
+        await message.answer("🏁 **Вся информация успешно загружена и проанализирована!**")
     except Exception as e:
         await message.answer(f"⚠️ Ошибка обработки куска данных: {e}")
+    finally:
+        # Гарантированный выход из блокировки в исходный режим загрузки
+        await state.set_state(AdminStates.upload_mode)
+        await message.answer("теперь можете продолжать загружать в меня информацию.", reply_markup=get_upload_keyboard())
 
-# Хендлеры загрузки
-@dp.message(AdminStates.upload_mode, F.text)
-async def handle_text_upload(message: types.Message, db_pool: asyncpg.Pool):
-    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    await process_and_save_knowledge(message.text, message, db_pool)
-
+# Хендлер загрузки ФАЙЛОВ (.txt и .pdf)
 @dp.message(AdminStates.upload_mode, F.document)
-async def handle_file_upload(message: types.Message, db_pool: asyncpg.Pool):
+async def handle_file_upload(message: types.Message, state: FSMContext, db_pool: asyncpg.Pool):
     document = message.document
     file_name = document.file_name.lower()
     
@@ -175,7 +206,9 @@ async def handle_file_upload(message: types.Message, db_pool: asyncpg.Pool):
         await message.answer("❌ Нужен файл в формате .txt или .pdf")
         return
         
-    await message.answer("⏳ Начинаю чтение документа...")
+    # Блокируем состояние и убираем инлайн-кнопки
+    await state.set_state(AdminStates.processing)
+    await message.answer("⏳ Начинаю чтение документа... Система заблокирована до конца обработки.", reply_markup=types.ReplyKeyboardRemove())
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
     file_in_memory = io.BytesIO()
@@ -196,7 +229,7 @@ async def handle_file_upload(message: types.Message, db_pool: asyncpg.Pool):
             total_pages = len(pdf_reader.pages)
             await message.answer(f"📄 Обнаружено страниц в PDF: {total_pages}\nЗапускаю пошаговую обработку...")
             
-            pages_per_chunk = 3  # Пакуем по 3 страницы, чтобы не превышать лимиты ИИ
+            pages_per_chunk = 3  # Пакуем по 3 страницы
             current_chunk_text = []
             chunk_counter = 1
             
@@ -204,7 +237,6 @@ async def handle_file_upload(message: types.Message, db_pool: asyncpg.Pool):
                 page_text = page.extract_text() or ""
                 current_chunk_text.append(page_text)
                 
-                # Отправляем пачку, если набралось 3 страницы или дошли до конца файла
                 if page_num % pages_per_chunk == 0 or page_num == total_pages:
                     full_chunk_text = "\n".join(current_chunk_text).strip()
                     
@@ -218,11 +250,16 @@ async def handle_file_upload(message: types.Message, db_pool: asyncpg.Pool):
                         
                     current_chunk_text = []
                     
-            await message.answer("🏁 **Вся книга знаний успешно загружена и проанализирована!**")
+        await message.answer("🏁 **Вся книга знаний успешно загружена и проанализирована!**")
             
     except Exception as e:
         await message.answer(f"❌ Критическая ошибка при чтении файла: {e}")
+    finally:
+        # Гарантированный выход из блокировки
+        await state.set_state(AdminStates.upload_mode)
+        await message.answer("теперь можете продолжать загружать в меня информацию.", reply_markup=get_upload_keyboard())
 
+# Главная функция запуска
 async def main():
     db_url = os.getenv("DATABASE_URL")
     pool = await asyncpg.create_pool(dsn=db_url, min_size=1, max_size=10)
