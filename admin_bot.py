@@ -2,6 +2,7 @@ import os
 import asyncio
 import json
 import io
+from datetime import datetime, timezone  # Изменение: добавили для работы со временем подписок
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.fsm.state import State, StatesGroup
@@ -35,7 +36,7 @@ def get_main_keyboard():
     builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
 
-# Меню режима загрузки (Reply-кнопки)
+# 📄 Меню режима загрузки (Reply-кнопки)
 def get_upload_keyboard():
     builder = ReplyKeyboardBuilder()
     builder.button(text="⬅️ Назад в меню")
@@ -70,11 +71,67 @@ async def get_embedding(text: str) -> list:
         print(f"Ошибка генерации эмбеддинга: {e}")
         return []
 
-# Хендлер команды /start
+
+# ================= ОБНОВЛЕННЫЙ ХЕНДЛЕР СТАРТА (ЭТАП 1) =================
+
 @dp.message(CommandStart())
-async def cmd_start(message: types.Message, state: FSMContext):
+async def cmd_start(message: types.Message, state: FSMContext, db_pool: asyncpg.Pool):
+    await state.clear()
+    
+    try:
+        async with db_pool.acquire() as conn:
+            # Запрашиваем данные админа и его компании одной связкой
+            user_info = await conn.fetchrow("""
+                SELECT a.role, a.company_id, c.company_name, c.subscription_expires_at 
+                FROM admin_users a
+                JOIN companies c ON a.company_id = c.id
+                WHERE a.telegram_id = $1;
+            """, message.from_user.id)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка подключения к базе данных: {e}")
+        return
+        
+    # Защита 1: Если пользователя вообще нет в таблице admin_users
+    if not user_info:
+        await message.answer("❌ **Доступ заблокирован.**\nВы не зарегистрированы в системе как администратор платформы.")
+        return
+
+    role = user_info['role']
+    company_name = user_info['company_name']
+    expires_at = user_info['subscription_expires_at']
+
+    # Защита 2: Проверка окончания триала / подписки (пропускаем только создателя с супер-ролью)
+    if role not in ["superadmin", "super_admin"]:
+        # Синхронизируем таймзоны (база обычно отдает с tzinfo)
+        now = datetime.now(timezone.utc) if expires_at and expires_at.tzinfo else datetime.now()
+        
+        if expires_at and expires_at < now:
+            await message.answer(
+                f"❌ **Доступ ограничен!**\n\n"
+                f"У компании **{company_name}** закончился тестовый период или подписка.\n"
+                f"Дата окончания доступа: {expires_at.strftime('%d.%m.%Y %H:%M')}.\n\n"
+                f"Для продления периода обратитесь к владельцу платформы."
+            )
+            return
+
+    # Если проверки пройдены — сохраняем метаданные в сессию FSM
+    await state.update_data(
+        company_id=user_info['company_id'],
+        role=role,
+        company_name=company_name
+    )
+    
     await state.set_state(AdminStates.main_menu)
-    await message.answer("Система управления знаниями запущена. Выбери режим:", reply_markup=get_main_keyboard())
+    await message.answer(
+        f"👋 Добро пожаловать в панель управления!\n"
+        f"🏢 Компания: **{company_name}**\n"
+        f"🛡️ Ваша роль: `{role}`\n\n"
+        f"Выбери режим работы:", 
+        reply_markup=get_main_keyboard()
+    )
+
+
+# ================= РЕЖИМЫ РАБОТЫ И КОНВЕЙЕРЫ (БЕЗ ИЗМЕНЕНИЙ) =================
 
 # Вход в режим загрузки
 @dp.message(F.text == "📥 Режим загрузки")
@@ -97,7 +154,7 @@ async def enter_admin_mode(message: types.Message, state: FSMContext, db_pool: a
             nodes_count = await conn.fetchval("SELECT COUNT(*) FROM graph_nodes;")
             edges_count = await conn.fetchval("SELECT COUNT(*) FROM graph_edges;")
         await message.answer(
-            f"📊 **База знаний:**\n• Узлов графа: {nodes_count}\n• Логических свясей: {edges_count}\n\n"
+            f"📊 **База знаний:**\n• Узлов графа: {nodes_count}\n• Логических связей: {edges_count}\n\n"
             f"Выберите действие ниже:", 
             reply_markup=get_admin_main_inline()
         )
@@ -300,11 +357,10 @@ async def inline_manage_files(callback: types.CallbackQuery, db_pool: asyncpg.Po
     
     for idx, filename in enumerate(files, start=1):
         text += f"{idx}. `{filename}`\n"
-        # Передаем индекс в callback_data, защищаясь от лимита в 64 байта
         builder.button(text=f"🗑️ Удалить {idx}", callback_data=f"del_file_{idx-1}")
         
     builder.button(text="⬅️ Назад в админку", callback_data="admin_to_main")
-    builder.adjust(2)  # Выстраиваем кнопки удаления по две в ряд
+    builder.adjust(2)
     
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=builder.as_markup())
 
@@ -324,17 +380,13 @@ async def inline_delete_specific_file(callback: types.CallbackQuery, db_pool: as
         await callback.answer(f"Удаляю {target_file}...")
         
         async with conn.transaction():
-            # Шаг A: Удаляем все логические связи, созданные этим файлом
             await conn.execute("DELETE FROM graph_edges WHERE source_file = $1;", target_file)
-            
-            # Шаг B: Удаляем узлы этого файла, НО ТОЛЬКО ЕСЛИ они не связаны оставшимися цепочками из других файлов
             await conn.execute("""
                 DELETE FROM graph_nodes 
                 WHERE source_file = $1 
                   AND id NOT IN (SELECT source_id FROM graph_edges UNION SELECT target_id FROM graph_edges);
             """, target_file)
             
-    # Возвращаем админа обратно в обновленный список файлов
     await inline_manage_files(callback, db_pool)
 
 # 3. Возврат на главный экран админки
