@@ -6,7 +6,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
-from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from openai import AsyncOpenAI
 import asyncpg
 from pypdf import PdfReader
@@ -24,10 +24,10 @@ dp = Dispatcher()
 class AdminStates(StatesGroup):
     main_menu = State()
     upload_mode = State()
-    processing = State()  # Состояние жесткой блокировки процессов
+    processing = State()  # Блокировка процессов во время работы ИИ
     admin_mode = State()
 
-# Главное меню
+# Главное меню (Reply-кнопки)
 def get_main_keyboard():
     builder = ReplyKeyboardBuilder()
     builder.button(text="📥 Режим загрузки")
@@ -35,11 +35,28 @@ def get_main_keyboard():
     builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
 
-# Меню режима загрузки
+# Меню режима загрузки (Reply-кнопки)
 def get_upload_keyboard():
     builder = ReplyKeyboardBuilder()
     builder.button(text="⬅️ Назад в меню")
     return builder.as_markup(resize_keyboard=True)
+
+# Инлайн-клавиатура для главного экрана админки
+def get_admin_main_inline():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📂 Управление файлами", callback_data="admin_manage_files")
+    builder.button(text="🗑️ Очистить ВСЮ базу", callback_data="admin_confirm_clear_all")
+    builder.adjust(1)
+    return builder.as_markup()
+
+# Хелпер для получения отсортированного списка уникальных файлов из БД
+async def get_unique_files(conn) -> list:
+    rows = await conn.fetch("""
+        SELECT DISTINCT source_file FROM graph_nodes WHERE source_file IS NOT NULL
+        UNION 
+        SELECT DISTINCT source_file FROM graph_edges WHERE source_file IS NOT NULL;
+    """)
+    return sorted([r['source_file'] for r in rows])
 
 # Функция создания вектора (эмбеддинга) смысла текста
 async def get_embedding(text: str) -> list:
@@ -71,7 +88,7 @@ async def back_to_main(message: types.Message, state: FSMContext):
     await state.set_state(AdminStates.main_menu)
     await message.answer("Вы вернулись в главное меню.", reply_markup=get_main_keyboard())
 
-# Вход в админ-панель
+# Вход в админ-панель (отображение статистики и инлайн-меню)
 @dp.message(F.text == "📊 Режим admin-панели")
 async def enter_admin_mode(message: types.Message, state: FSMContext, db_pool: asyncpg.Pool):
     await state.set_state(AdminStates.admin_mode)
@@ -79,11 +96,15 @@ async def enter_admin_mode(message: types.Message, state: FSMContext, db_pool: a
         async with db_pool.acquire() as conn:
             nodes_count = await conn.fetchval("SELECT COUNT(*) FROM graph_nodes;")
             edges_count = await conn.fetchval("SELECT COUNT(*) FROM graph_edges;")
-        await message.answer(f"📊 **База знаний:**\n• Узлов: {nodes_count}\n• Связей: {edges_count}\n\nВыход: /start")
+        await message.answer(
+            f"📊 **База знаний:**\n• Узлов графа: {nodes_count}\n• Логических свясей: {edges_count}\n\n"
+            f"Выберите действие ниже:", 
+            reply_markup=get_admin_main_inline()
+        )
     except Exception as e:
         await message.answer(f"Ошибка БД: {e}")
 
-# ХЕНДЛЕР-ЗАГЛУШКА: блокирует любые действия пользователя во время обработки ИИ
+# ХЕНДЛЕР-ЗАГЛУШКА: жесткий щит от спама во время работы ИИ
 @dp.message(AdminStates.processing)
 async def handle_processing_lock(message: types.Message):
     await message.answer(
@@ -92,8 +113,8 @@ async def handle_processing_lock(message: types.Message):
         "Как только я закончу, я сразу вам сообщу!"
     )
 
-# Конвейер разбора и векторной записи графа
-async def process_and_save_knowledge(text_content: str, message: types.Message, db_pool: asyncpg.Pool):
+# Конвейер разбора и векторной записи графа (с поддержкой source_file)
+async def process_and_save_knowledge(text_content: str, message: types.Message, db_pool: asyncpg.Pool, source_file: str):
     system_prompt = (
         "Ты — универсальный ИИ-архитектор графов знаний. Твоя задача — проанализировать входящий текст "
         "и разбить его на атомарные смысловые узлы и логические связи между ними.\n\n"
@@ -146,13 +167,14 @@ async def process_and_save_knowledge(text_content: str, message: types.Message, 
                 if existing_node_id:
                     inserted_node_ids.append(existing_node_id)
                 else:
+                    # Записываем новый узел и помечаем, из какого он файла
                     node_id = await conn.fetchval(
                         """
-                        INSERT INTO graph_nodes (content, node_type, embedding) 
-                        VALUES ($1, $2, $3::vector) 
+                        INSERT INTO graph_nodes (content, node_type, embedding, source_file) 
+                        VALUES ($1, $2, $3::vector, $4) 
                         RETURNING id;
                         """,
-                        content, node_type, str(embedding)
+                        content, node_type, str(embedding), source_file
                     )
                     inserted_node_ids.append(node_id)
                     
@@ -163,36 +185,37 @@ async def process_and_save_knowledge(text_content: str, message: types.Message, 
                 tgt_idx = edge["target_index"]
                 
                 if src_idx < len(inserted_node_ids) and tgt_idx < len(inserted_node_ids):
+                    # Записываем связь и помечаем, к какому файлу она относится
                     await conn.execute(
                         """
-                        INSERT INTO graph_edges (source_id, target_id, relation_type) 
-                        VALUES ($1, $2, $3)
+                        INSERT INTO graph_edges (source_id, target_id, relation_type, source_file) 
+                        VALUES ($1, $2, $3, $4)
                         ON CONFLICT DO NOTHING;
                         """,
-                        inserted_node_ids[src_idx], inserted_node_ids[tgt_idx], edge["relation_type"]
+                        inserted_node_ids[src_idx], inserted_node_ids[tgt_idx], edge["relation_type"], source_file
                     )
                     edges_count += 1
                     
         await message.answer(
-            f"🚀 **Векторная интеграция части завершена!**\n"
+            f"🚀 **Интеграция блока завершена!**\n"
+            f"• Файл: `{source_file}`\n"
             f"• Обработано блоков: {len(inserted_node_ids)}\n"
-            f"• Проверено/создано связей: {edges_count}"
+            f"• Создано связей: {edges_count}"
         )
 
 # Хендлер загрузки чистого ТЕКСТА
 @dp.message(AdminStates.upload_mode, F.text)
 async def handle_text_upload(message: types.Message, state: FSMContext, db_pool: asyncpg.Pool):
-    # Включаем блокировку процессов
     await state.set_state(AdminStates.processing)
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
+    source_name = "Ручной ввод текста"
     try:
-        await process_and_save_knowledge(message.text, message, db_pool)
+        await process_and_save_knowledge(message.text, message, db_pool, source_name)
         await message.answer("🏁 **Вся информация успешно загружена и проанализирована!**")
     except Exception as e:
         await message.answer(f"⚠️ Ошибка обработки куска данных: {e}")
     finally:
-        # Гарантированный выход из блокировки в исходный режим загрузки
         await state.set_state(AdminStates.upload_mode)
         await message.answer("теперь можете продолжать загружать в меня информацию.", reply_markup=get_upload_keyboard())
 
@@ -200,13 +223,13 @@ async def handle_text_upload(message: types.Message, state: FSMContext, db_pool:
 @dp.message(AdminStates.upload_mode, F.document)
 async def handle_file_upload(message: types.Message, state: FSMContext, db_pool: asyncpg.Pool):
     document = message.document
-    file_name = document.file_name.lower()
+    file_name = document.file_name
+    file_name_lower = file_name.lower()
     
-    if not (file_name.endswith('.txt') or file_name.endswith('.pdf')):
+    if not (file_name_lower.endswith('.txt') or file_name_lower.endswith('.pdf')):
         await message.answer("❌ Нужен файл в формате .txt или .pdf")
         return
         
-    # Блокируем состояние и убираем инлайн-кнопки
     await state.set_state(AdminStates.processing)
     await message.answer("⏳ Начинаю чтение документа... Система заблокирована до конца обработки.", reply_markup=types.ReplyKeyboardRemove())
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
@@ -216,20 +239,20 @@ async def handle_file_upload(message: types.Message, state: FSMContext, db_pool:
     file_in_memory.seek(0)
     
     try:
-        if file_name.endswith('.txt'):
+        if file_name_lower.endswith('.txt'):
             extracted_text = file_in_memory.read().decode('utf-8', errors='ignore')
             if not extracted_text.strip():
                 await message.answer("⚠️ Файл пустой.")
                 return
             await message.answer("📖 Текст считан. Отправляю в DeepSeek...")
-            await process_and_save_knowledge(extracted_text, message, db_pool)
+            await process_and_save_knowledge(extracted_text, message, db_pool, file_name)
             
-        elif file_name.endswith('.pdf'):
+        elif file_name_lower.endswith('.pdf'):
             pdf_reader = PdfReader(file_in_memory)
             total_pages = len(pdf_reader.pages)
             await message.answer(f"📄 Обнаружено страниц в PDF: {total_pages}\nЗапускаю пошаговую обработку...")
             
-            pages_per_chunk = 3  # Пакуем по 3 страницы
+            pages_per_chunk = 3  
             current_chunk_text = []
             chunk_counter = 1
             
@@ -244,9 +267,9 @@ async def handle_file_upload(message: types.Message, state: FSMContext, db_pool:
                         await message.answer(f"🔄 Обрабатываю часть {chunk_counter} (страницы {page_num - len(current_chunk_text) + 1} - {page_num})...")
                         await bot.send_chat_action(chat_id=message.chat.id, action="typing")
                         
-                        await process_and_save_knowledge(full_chunk_text, message, db_pool)
+                        await process_and_save_knowledge(full_chunk_text, message, db_pool, file_name)
                         chunk_counter += 1
-                        await asyncio.sleep(1)  # Защита от спама в API
+                        await asyncio.sleep(1)  
                         
                     current_chunk_text = []
                     
@@ -255,9 +278,100 @@ async def handle_file_upload(message: types.Message, state: FSMContext, db_pool:
     except Exception as e:
         await message.answer(f"❌ Критическая ошибка при чтении файла: {e}")
     finally:
-        # Гарантированный выход из блокировки
         await state.set_state(AdminStates.upload_mode)
         await message.answer("теперь можете продолжать загружать в меня информацию.", reply_markup=get_upload_keyboard())
+
+
+# ================= ИНЛАЙН ХЕНДЛЕРЫ АДМИН-ПАНЕЛИ =================
+
+# 1. Вывод списка файлов для удаления
+@dp.callback_query(AdminStates.admin_mode, F.data == "admin_manage_files")
+async def inline_manage_files(callback: types.CallbackQuery, db_pool: asyncpg.Pool):
+    await callback.answer()
+    async with db_pool.acquire() as conn:
+        files = await get_unique_files(conn)
+        
+    if not files:
+        await callback.message.edit_text("📂 В базе знаний пока нет загруженных файлов.", reply_markup=get_admin_main_inline())
+        return
+        
+    text = "📂 **Список загруженных файлов в БД:**\nНажмите на кнопку с номером, чтобы удалить конкретный файл:\n\n"
+    builder = InlineKeyboardBuilder()
+    
+    for idx, filename in enumerate(files, start=1):
+        text += f"{idx}. `{filename}`\n"
+        # Передаем индекс в callback_data, защищаясь от лимита в 64 байта
+        builder.button(text=f"🗑️ Удалить {idx}", callback_data=f"del_file_{idx-1}")
+        
+    builder.button(text="⬅️ Назад в админку", callback_data="admin_to_main")
+    builder.adjust(2)  # Выстраиваем кнопки удаления по две в ряд
+    
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=builder.as_markup())
+
+# 2. Обработка удаления КОНКРЕТНОГО файла по его индексу
+@dp.callback_query(AdminStates.admin_mode, F.data.startswith("del_file_"))
+async def inline_delete_specific_file(callback: types.CallbackQuery, db_pool: asyncpg.Pool):
+    file_idx = int(callback.data.split("_")[2])
+    
+    async with db_pool.acquire() as conn:
+        files = await get_unique_files(conn)
+        
+        if file_idx >= len(files):
+            await callback.answer("❌ Файл уже не существует или список обновился.")
+            return
+            
+        target_file = files[file_idx]
+        await callback.answer(f"Удаляю {target_file}...")
+        
+        async with conn.transaction():
+            # Шаг A: Удаляем все логические связи, созданные этим файлом
+            await conn.execute("DELETE FROM graph_edges WHERE source_file = $1;", target_file)
+            
+            # Шаг B: Удаляем узлы этого файла, НО ТОЛЬКО ЕСЛИ они не связаны оставшимися цепочками из других файлов
+            await conn.execute("""
+                DELETE FROM graph_nodes 
+                WHERE source_file = $1 
+                  AND id NOT IN (SELECT source_id FROM graph_edges UNION SELECT target_id FROM graph_edges);
+            """, target_file)
+            
+    # Возвращаем админа обратно в обновленный список файлов
+    await inline_manage_files(callback, db_pool)
+
+# 3. Возврат на главный экран админки
+@dp.callback_query(AdminStates.admin_mode, F.data == "admin_to_main")
+async def inline_back_to_admin_main(callback: types.CallbackQuery, db_pool: asyncpg.Pool):
+    await callback.answer()
+    async with db_pool.acquire() as conn:
+        nodes_count = await conn.fetchval("SELECT COUNT(*) FROM graph_nodes;")
+        edges_count = await conn.fetchval("SELECT COUNT(*) FROM graph_edges;")
+    await callback.message.edit_text(
+        f"📊 **База знаний:**\n• Узлов графа: {nodes_count}\n• Логических связей: {edges_count}\n\n"
+        f"Выберите действие ниже:", 
+        reply_markup=get_admin_main_inline()
+    )
+
+# 4. Запрос на полное очищение базы (защита от случайного клика)
+@dp.callback_query(AdminStates.admin_mode, F.data == "admin_confirm_clear_all")
+async def inline_confirm_clear(callback: types.CallbackQuery):
+    await callback.answer()
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💥 ДА, СТЕРЕТЬ ВСЁ", callback_data="admin_action_clear_all")
+    builder.button(text="❌ ОТМЕНА", callback_data="admin_to_main")
+    builder.adjust(1)
+    await callback.message.edit_text("⚠️ **ВНИМАНИЕ!** Вы уверены, что хотите полностью очистить базу знаний? Это действие необратимо.", reply_markup=builder.as_markup())
+
+# 5. Выполнение полной очистки базы
+@dp.callback_query(AdminStates.admin_mode, F.data == "admin_action_clear_all")
+async def inline_execute_clear_all(callback: types.CallbackQuery, db_pool: asyncpg.Pool):
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("TRUNCATE graph_edges, graph_nodes RESTART IDENTITY CASCADE;")
+        await callback.answer("База полностью очищена!", show_alert=True)
+    except Exception as e:
+        await callback.answer(f"Ошибка: {e}", show_alert=True)
+        
+    await inline_back_to_admin_main(callback, db_pool)
+
 
 # Главная функция запуска
 async def main():
